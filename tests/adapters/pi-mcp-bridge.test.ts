@@ -1130,3 +1130,112 @@ describe("foreground keep-alive — idle reaper scoped by session kind (#868)", 
     client.shutdown();
   });
 });
+
+// ── AbortSignal: cancel an in-flight tools/call ─────────────────────────────
+//
+// Regression: Pi passes an AbortSignal to each tool's execute() callback so
+// Escape / new-turn / turn-abort can interrupt a running tool. The bridge
+// previously dropped that signal — execute() didn't accept it, and callTool()
+// passed Number.POSITIVE_INFINITY with no abort path. A hung ctx_execute
+// (infinite loop, long build) blocked the Pi session indefinitely.
+//
+// Fix: execute() accepts the signal, callTool() forwards it to request(),
+// and request() races the pending promise against the signal. On abort the
+// promise rejects with AbortError AND the MCP child is killed so the
+// in-flight subprocess stops consuming CPU. The child respawns on the next
+// request via the existing respawn-on-exit path.
+describe("MCPStdioClient — abort interrupts an in-flight tools/call", () => {
+  it("rejects with AbortError and kills the child when the signal fires", async () => {
+    // Fake MCP server: answers initialize + tools/list, but HANGS on
+    // tools/call (never writes a response). This is the bug condition —
+    // without abort support the request would hang forever.
+    const fakePath = join(scratch, "hang-on-call.mjs");
+    writeFileSync(
+      fakePath,
+      `
+      let line = "";
+      process.stdin.on("data", (chunk) => {
+        line += chunk.toString("utf-8");
+        let idx;
+        while ((idx = line.indexOf("\\n")) >= 0) {
+          const raw = line.slice(0, idx).trim();
+          line = line.slice(idx + 1);
+          if (!raw) continue;
+          let msg;
+          try { msg = JSON.parse(raw); } catch { continue; }
+          if (msg.method === "initialize") {
+            process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: { protocolVersion: "2025-06-18", capabilities: {} } }) + "\\n");
+          } else if (msg.method === "tools/list") {
+            process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: { tools: [{ name: "hang", description: "h", inputSchema: { type: "object" } }] } }) + "\\n");
+          } else if (msg.method === "tools/call") {
+            // Deliberately do NOT respond — simulates a hung subprocess.
+          }
+        }
+      });
+      setInterval(() => {}, 60000);
+      `,
+      "utf-8",
+    );
+
+    const { MCPStdioClient } = await import(
+      "../../src/adapters/pi/mcp-bridge.js"
+    );
+    const client = new MCPStdioClient(fakePath);
+    client.start();
+    await client.initialize();
+
+    const child = (client as unknown as { child: { pid: number; killed: boolean; exitCode: number | null; signalCode: string | null; on: (e: string, cb: () => void) => void } }).child;
+    const pid = child.pid;
+    expect(pid).toBeTruthy();
+
+    const controller = new AbortController();
+    const callPromise = client.callTool("hang", {}, controller.signal);
+
+    // Give the request a moment to be written to the child, then abort.
+    await new Promise((r) => setTimeout(r, 50));
+    controller.abort();
+
+    // The promise MUST reject with AbortError, not hang.
+    await expect(callPromise).rejects.toThrow(/aborted/i);
+
+    // The child MUST be killed — the in-flight subprocess stops.
+    // Wait for the exit event so we can inspect the final state.
+    await new Promise<void>((resolve) => {
+      child.on("exit", () => resolve());
+      // Fallback: if already exited, resolve immediately.
+      if (child.exitCode !== null || child.signalCode !== null) resolve();
+      setTimeout(resolve, 2000);
+    });
+
+    // Process is gone (killed by our SIGTERM).
+    expect(child.signalCode).not.toBeNull();
+
+    client.shutdown();
+  }, 10_000);
+
+  it("rejects immediately when the signal is already aborted", async () => {
+    const { MCPStdioClient } = await import(
+      "../../src/adapters/pi/mcp-bridge.js"
+    );
+    const client = new MCPStdioClient("/unused/server.mjs");
+    // Plant a fake child so request() gets past the "not started" guard.
+    const fakeStdin = new EventEmitter() as EventEmitter & {
+      destroyed: boolean;
+      writableEnded: boolean;
+      closed: boolean;
+      write: () => boolean;
+    };
+    fakeStdin.destroyed = false;
+    fakeStdin.writableEnded = false;
+    fakeStdin.closed = false;
+    fakeStdin.write = () => false;
+    (client as unknown as { child: unknown }).child = { stdin: fakeStdin };
+
+    const controller = new AbortController();
+    controller.abort();
+
+    await expect(
+      client.request("tools/call", {}, Number.POSITIVE_INFINITY, controller.signal),
+    ).rejects.toThrow(/aborted/i);
+  });
+});
