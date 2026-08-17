@@ -552,6 +552,7 @@ export class MCPStdioClient {
     method: string,
     params: unknown,
     timeoutMs: number = DEFAULT_REQUEST_TIMEOUT_MS,
+    signal?: AbortSignal,
   ): Promise<T> {
     // Respawn-on-idle-exit (#583, #583-followup).
     //
@@ -591,16 +592,47 @@ export class MCPStdioClient {
             reject(new Error(`MCP request timeout after ${timeoutMs}ms: ${method}`));
           }, timeoutMs)
         : null;
+
+      // Register the pending entry FIRST so the abort handler (which may
+      // fire synchronously when the signal is already aborted) can find
+      // and delete it. Without this ordering, an already-aborted signal
+      // would pass the has(id) guard, skip reject, and the promise would
+      // never settle.
       this.pending.set(id, {
         resolve: (v) => {
           if (timer) clearTimeout(timer);
+          if (signal) signal.removeEventListener("abort", onAbort);
           resolve(v as T);
         },
         reject: (e) => {
           if (timer) clearTimeout(timer);
+          if (signal) signal.removeEventListener("abort", onAbort);
           reject(e);
         },
       });
+
+      // Abort handling: when Pi cancels the tool call (Escape, turn abort,
+      // new turn), the signal fires. We must (a) reject the caller's promise
+      // so Pi unblocks immediately, and (b) kill the MCP child so the
+      // in-flight subprocess (ctx_execute's spawned process) actually stops
+      // consuming CPU. The child respawns on the next request via the
+      // existing respawn-on-exit path. This mirrors how Pi's own bash tool
+      // wires signal → killTree.
+      const onAbort = () => {
+        if (!this.pending.has(id)) return;
+        this.pending.delete(id);
+        if (timer) clearTimeout(timer);
+        this.killChild();
+        reject(new DOMException("The operation was aborted.", "AbortError"));
+      };
+      if (signal) {
+        if (signal.aborted) {
+          onAbort();
+          return;
+        }
+        signal.addEventListener("abort", onAbort, { once: true });
+      }
+
       const frame = JSON.stringify({ jsonrpc: "2.0", id, method, params });
       const rejectWrite = (err: Error) => {
         const handler = this.pending.get(id);
@@ -679,7 +711,7 @@ export class MCPStdioClient {
     return Array.isArray(result.tools) ? result.tools : [];
   }
 
-  async callTool(name: string, args: unknown): Promise<MCPCallResult> {
+  async callTool(name: string, args: unknown, signal?: AbortSignal): Promise<MCPCallResult> {
     // Respawn-on-idle-exit is now handled centrally in `request()`
     // (#583 follow-up). Originally patched here in #583 — moving it up
     // one layer covers `listTools` / `initialize` paths too, with a
@@ -693,11 +725,43 @@ export class MCPStdioClient {
     // executor layer (per-tool timeout / background mode / Pi cancel),
     // not the transport. `Number.POSITIVE_INFINITY` instructs
     // `request()` to skip the setTimeout entirely — see the gate there.
+    //
+    // `signal` is Pi's AbortSignal from the tool execute() callback —
+    // when Pi cancels the turn (Escape / new turn), the signal fires and
+    // `request()` kills the MCP child so the in-flight subprocess stops.
     return this.request<MCPCallResult>(
       "tools/call",
       { name, arguments: args ?? {} },
       Number.POSITIVE_INFINITY,
+      signal,
     );
+  }
+
+  /**
+   * Kill the MCP child process so an in-flight `tools/call` subprocess
+   * stops consuming CPU after an abort. SIGTERM first, SIGKILL after 5s
+   * (same shape as {@link shutdown}). Does NOT null `this.child` or set
+   * `this.exited` — the child's `exit` event fires {@link onExit} which
+   * handles state cleanup and clears remaining pending entries. The next
+   * `request()` then respawns via the existing respawn-on-exit path.
+   */
+  private killChild(): void {
+    if (!this.child) return;
+    const child = this.child;
+    try {
+      child.kill("SIGTERM");
+    } catch {
+      // best effort
+    }
+    setTimeout(() => {
+      try {
+        if (child.exitCode === null && child.signalCode === null) {
+          child.kill("SIGKILL");
+        }
+      } catch {
+        // best effort
+      }
+    }, 5000).unref();
   }
 
   /**
@@ -784,6 +848,7 @@ export interface PiToolRegistration {
   execute: (
     toolCallId: string,
     params: Record<string, unknown>,
+    signal: AbortSignal | undefined,
   ) => Promise<{
     content: Array<{ type: "text"; text: string }>;
     details: Record<string, unknown>;
@@ -1031,8 +1096,8 @@ export async function bootstrapMCPTools(
       parameters: tool.inputSchema ?? { type: "object", properties: {} },
       renderCall: createContextModeCallRenderer(tool.name),
       renderResult: createContextModeResultRenderer(tool.name),
-      async execute(_toolCallId, params) {
-        const result = await client.callTool(tool.name, params ?? {});
+      async execute(_toolCallId, params, signal) {
+        const result = await client.callTool(tool.name, params ?? {}, signal);
         const text = (result.content ?? [])
           .filter((c) => c?.type === "text" && typeof c.text === "string")
           .map((c) => c.text as string)
