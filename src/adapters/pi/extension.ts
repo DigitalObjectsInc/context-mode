@@ -23,6 +23,7 @@ import type { HookInput } from "../../session/extract.js";
 import { buildResumeSnapshot } from "../../session/snapshot.js";
 import type { SessionEvent } from "../../types.js";
 import { bootstrapMCPTools, makeBridgeDiag, isForegroundSession, type BridgeHandle } from "./mcp-bridge.js";
+import { registerAsyncBash, type JobSupervisor } from "./async-bash.js";
 import { PiAdapter } from "./index.js";
 
 // ── Pi Tool Name Mapping ─────────────────────────────────
@@ -462,6 +463,18 @@ export default function piExtension(pi: any): void {
 
   const db = getOrCreateDB(projectDir);
 
+  // Always-async bash: re-register the "bash" tool so every call returns a
+  // job handle immediately and pushes the result via sendUserMessage on
+  // completion. The supervisor lives for the process lifetime; we cancel
+  // all live jobs on session_shutdown to prevent zombies.
+  let asyncBashSupervisor: JobSupervisor | null = null;
+  try {
+    asyncBashSupervisor = registerAsyncBash(pi, () => projectDir);
+  } catch {
+    // Best effort — never break session start. If sendUserMessage is
+    // unavailable the built-in synchronous bash stays registered.
+  }
+
   // ── 1. session_start — Initialize session ──────────────
 
   pi.on("session_start", (_event: any, ctx: any) => {
@@ -856,6 +869,11 @@ export default function piExtension(pi: any): void {
   // ── 7. session_shutdown — Cleanup old sessions ─────────
 
   pi.on("session_shutdown", async () => {
+    try {
+      asyncBashSupervisor?.cancelAll();
+    } catch {
+      // best effort — never block shutdown
+    }
     try {
       if (_db) {
         _db.cleanupOldSessions(7);
