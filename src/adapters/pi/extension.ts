@@ -23,7 +23,7 @@ import type { HookInput } from "../../session/extract.js";
 import { buildResumeSnapshot } from "../../session/snapshot.js";
 import type { SessionEvent } from "../../types.js";
 import { bootstrapMCPTools, makeBridgeDiag, isForegroundSession, type BridgeHandle } from "./mcp-bridge.js";
-import { registerAsyncBash, type JobSupervisor } from "./async-bash.js";
+import { JobSupervisor, formatResultMessage } from "./async-bash.js";
 import { PiAdapter } from "./index.js";
 
 // ── Pi Tool Name Mapping ─────────────────────────────────
@@ -463,16 +463,27 @@ export default function piExtension(pi: any): void {
 
   const db = getOrCreateDB(projectDir);
 
-  // Always-async bash: re-register the "bash" tool so every call returns a
-  // job handle immediately and pushes the result via sendUserMessage on
-  // completion. The supervisor lives for the process lifetime; we cancel
-  // all live jobs on session_shutdown to prevent zombies.
+  // Always-async bash: intercept bash calls in the tool_call hook so
+  // every call starts a supervised background job and returns a job handle
+  // immediately. The built-in synchronous bash never runs. When the job
+  // finishes, the result is pushed via pi.sendUserMessage (followUp) —
+  // wakes the agent if idle, lands at the turn boundary if mid-turn.
+  // We intercept in tool_call (not by re-registering the tool) because
+  // pi's tool-registry dispatch prefers the built-in bash's execute even
+  // when an extension registers a same-named override.
   let asyncBashSupervisor: JobSupervisor | null = null;
   try {
-    asyncBashSupervisor = registerAsyncBash(pi, () => projectDir);
+    asyncBashSupervisor = new JobSupervisor((job) => {
+      const msg = formatResultMessage(job);
+      if (pi.sendUserMessage) {
+        pi.sendUserMessage(msg, { deliverAs: "followUp", expandPromptTemplates: false });
+      } else {
+        pi.logger?.warn?.(`[async-bash] job ${job.id} finished (${job.state}) but sendUserMessage unavailable`);
+      }
+    });
   } catch {
-    // Best effort — never break session start. If sendUserMessage is
-    // unavailable the built-in synchronous bash stays registered.
+    // Best effort — never break session start. If the supervisor can't
+    // be created, bash falls back to the built-in synchronous behavior.
   }
 
   // ── 1. session_start — Initialize session ──────────────
@@ -534,6 +545,23 @@ export default function piExtension(pi: any): void {
               "`curl -s -o /tmp/x.json URL` or `wget -q -O /tmp/x.json URL`.",
           };
         }
+      }
+
+      // Command passed routing — intercept as async bash job.
+      // Start the command as a supervised background process and block
+      // the built-in synchronous bash from running. The model sees the
+      // job handle immediately; the result arrives via sendUserMessage
+      // when the subprocess exits.
+      if (asyncBashSupervisor) {
+        const handle = asyncBashSupervisor.start(command, projectDir);
+        return {
+          block: true,
+          reason:
+            `Job started: ${handle.jobId}\n` +
+            `Status: ${handle.status}\n` +
+            `Log: ${handle.logFile}\n\n` +
+            `The result will arrive automatically when the command finishes. Do not poll.`,
+        };
       }
     } catch {
       // Routing failure — allow passthrough
