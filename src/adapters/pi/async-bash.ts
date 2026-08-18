@@ -29,8 +29,8 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import {
   mkdirSync,
-  createWriteStream,
-  type WriteStream,
+  openSync,
+  closeSync,
   existsSync,
   rmSync,
   readFileSync,
@@ -60,7 +60,6 @@ export interface Job {
   startedAt: number;
   endedAt: number | null;
   child: ChildProcess | null;
-  stream: WriteStream | null;
 }
 
 export interface JobHandle {
@@ -168,16 +167,22 @@ export class JobSupervisor {
   start(command: string, cwd: string, env?: NodeJS.ProcessEnv): JobHandle {
     const id = newJobId();
     const logFile = join(jobsDir(), `${id}.log`);
-    const stream = createWriteStream(logFile, { flags: "w" });
 
+    // Direct-fd stdio + unref: the child writes straight to the log file
+    // and does NOT keep the parent's event loop alive. Without this, piped
+    // stdio + .on("data") listeners would hold pi's event loop open, so the
+    // turn could not end while the job runs.
+    const fd = openSync(logFile, "w");
     const child = spawn(command, {
       cwd,
       env: env ?? process.env,
       shell: true,
-      stdio: ["ignore", "pipe", "pipe"],
-      detached: !isWindows, // new process group so killTree can reap children
+      stdio: ["ignore", fd, fd],
+      detached: !isWindows,
       windowsHide: true,
     });
+    closeSync(fd);
+    child.unref();
 
     const job: Job = {
       id,
@@ -190,25 +195,8 @@ export class JobSupervisor {
       startedAt: Date.now(),
       endedAt: null,
       child,
-      stream,
     };
     this.jobs.set(id, job);
-
-    // Stream stdout + stderr to the log file. Prefix stderr lines so the
-    // model can distinguish them when reading the tail.
-    const writeChunk = (chunk: Buffer, isErr: boolean) => {
-      try {
-        if (isErr) {
-          stream.write(chunk.toString("utf-8").replace(/^/gm, "[stderr] "));
-        } else {
-          stream.write(chunk);
-        }
-      } catch {
-        // Stream may have closed; best effort.
-      }
-    };
-    child.stdout?.on("data", (c: Buffer) => writeChunk(c, false));
-    child.stderr?.on("data", (c: Buffer) => writeChunk(c, true));
 
     const settle = (exitCode: number | null, state: JobState) => {
       // Guard on endedAt (not state name) so cancel() — which sets
@@ -219,13 +207,7 @@ export class JobSupervisor {
       job.state = state;
       job.exitCode = exitCode;
       job.endedAt = Date.now();
-      try {
-        stream.end();
-      } catch {
-        // best effort
-      }
       job.child = null;
-      job.stream = null;
       this.onDone(job);
     };
 
@@ -241,8 +223,8 @@ export class JobSupervisor {
     child.on("error", (err) => {
       // Spawn itself failed (ENOENT, EACCES, …) — not a command failure.
       try {
-        stream.write(`[spawn error: ${err.message}]\n`);
-        stream.end();
+        const { appendFileSync } = require("node:fs");
+        appendFileSync(logFile, `[spawn error: ${err.message}]\n`);
       } catch {
         // best effort
       }
